@@ -1,0 +1,1779 @@
+---
+title: "trt_het_wass_vignette"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# WASS INFERENCE START 
+# Gist: need a command which takes X, A, Y vectors, returns the following:
+# the heterogineity decomposition, estimated Psi^2 wasserstein effect across 
+# covariates, testing for each term(?) [READ THE TESTING SECTION!]
+
+
+# Helper, makes design matrix
+make_design_matrix <- function(X, add_intercept = TRUE) {
+  if (is.data.frame(X)) {
+    non_numeric <- !vapply(X, is.numeric, logical(1))
+    if (any(non_numeric)) {
+      stop(
+        "X must be numeric. Expand factors and construct nonlinear bases ",
+        "before passing X to this function."
+      )
+    }
+  }
+  
+  X <- as.matrix(X)
+  storage.mode(X) <- "double"
+
+  if (length(X) == 0L || nrow(X) == 0L) {
+    stop("X must contain at least one observation.")
+  }
+
+  if (any(!is.finite(X))) {
+    stop("X contains non-finite values.")
+  }
+
+  if (is.null(colnames(X))) {
+    colnames(X) <- paste0("x", seq_len(ncol(X)))
+  }
+
+  if (add_intercept) {
+    X <- cbind("(Intercept)" = rep(1, nrow(X)), X)
+  }
+
+  X
+}
+
+# For checking u \in (0,1)
+validate_u_grid <- function(u) {
+  if (!is.numeric(u) || length(u) < 3L) {
+    stop("u must be a numeric vector with at least three interior grid values.")
+  }
+
+  if (any(!is.finite(u)) || any(u <= 0) || any(u >= 1)) {
+    stop("All grid values u must lie strictly inside (0, 1).")
+  }
+
+  if (any(diff(u) <= 0)) {
+    stop("u must be strictly increasing.")
+  }
+
+  invisible(TRUE)
+}
+
+
+# Riemann rectangle heights 
+quadrature_weights <- function(u,
+                               rule = c("trapezoid", "midpoint")) {
+  validate_u_grid(u)
+  rule <- match.arg(rule)
+
+  M <- length(u)
+
+  if (rule == "midpoint") {
+    # Partitions [0, (u1+u2)/2], ..., [(uM-1+uM)/2, 1].
+    boundaries <- c(
+      0,
+      (u[-1L] + u[-M]) / 2,
+      1
+    )
+    w <- diff(boundaries)
+  } else {
+    # Trapezoid rule with constant extrapolation from u_1 to 0
+    # and from u_M to 1.
+    w <- numeric(M)
+
+    w[1L] <- u[1L] + (u[2L] - u[1L]) / 2
+    w[M] <- (1 - u[M]) + (u[M] - u[M - 1L]) / 2
+
+    if (M > 2L) {
+      w[2L:(M - 1L)] <- (
+        (u[2L:(M - 1L)] - u[1L:(M - 2L)]) / 2 +
+          (u[3L:M] - u[2L:(M - 1L)]) / 2
+      )
+    }
+  }
+
+  if (any(w <= 0) || abs(sum(w) - 1) > 1e-10) {
+    stop("Quadrature weights are invalid.")
+  }
+
+  w
+}
+
+# Grid integral approximation
+integrate_u <- function(H, w) {
+  if (is.null(dim(H))) {
+    if (length(H) != length(w)) {
+      stop("Vector H and quadrature weights w have incompatible lengths.")
+    }
+    return(sum(H * w))
+  }
+
+  H <- as.matrix(H)
+
+  if (ncol(H) != length(w)) {
+    stop("The number of columns of H must equal length(w).")
+  }
+
+  rowSums(sweep(H, 2L, w, FUN = "*"))
+}
+
+standard_error_from_if <- function(influence_values) {
+  influence_values <- as.numeric(influence_values)
+
+  if (length(influence_values) < 2L) {
+    return(NA_real_)
+  }
+
+  sqrt(stats::var(influence_values) / length(influence_values))
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# Monotone rearrangement of quantile curves
+#
+# For a fixed x, the rearranged curve is the quantile function of
+# Q_hat(U | x), where U is approximately Uniform(0,1).
+#
+# This implementation allows non-equally-spaced u grids by using quadrature
+# weights in the empirical distribution of Q_hat(U | x).
+# -----------------------------------------------------------------------------
+
+weighted_rearrange_row <- function(q, u, w) {
+  ord <- order(q, na.last = NA)
+
+  if (length(ord) != length(q)) {
+    stop("Quantile predictions contain missing values.")
+  }
+
+  q_sorted <- q[ord]
+  cumulative_weight <- cumsum(w[ord])
+
+  index <- vapply(
+    u,
+    FUN = function(uu) {
+      hit <- which(cumulative_weight >= uu - sqrt(.Machine$double.eps))
+      if (length(hit) == 0L) length(q_sorted) else hit[1L]
+    },
+    FUN.VALUE = integer(1L)
+  )
+
+  q_sorted[index]
+}
+
+
+rearrange_quantile_matrix <- function(Q, u, w) {
+  Q <- as.matrix(Q)
+
+  if (ncol(Q) != length(u) || length(u) != length(w)) {
+    stop("Q, u, and w have incompatible dimensions.")
+  }
+
+  out <- t(vapply(
+    seq_len(nrow(Q)),
+    FUN = function(i) weighted_rearrange_row(Q[i, ], u = u, w = w),
+    FUN.VALUE = numeric(length(u))
+  ))
+
+  colnames(out) <- paste0("u_", format(u, trim = TRUE))
+  out
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# Conditional density estimation at Q_a(u | x)
+#
+# Since dQ(u | x)/du = 1 / f(Q(u | x) | x), estimate density by a finite
+# difference approximation to the derivative of the rearranged quantile curve.
+#
+# A slope floor is required because a finite grid and rearrangement can produce
+# flat local stretches. This is a numerical regularization parameter and should
+# be included in sensitivity analysis.
+# -----------------------------------------------------------------------------
+
+density_from_quantile_grid <- function(Q,
+                                       u,
+                                       slope_floor,
+                                       density_cap = Inf) {
+  Q <- as.matrix(Q)
+  validate_u_grid(u)
+
+  if (ncol(Q) != length(u)) {
+    stop("Q and u have incompatible dimensions.")
+  }
+
+  if (!is.numeric(slope_floor) ||
+      length(slope_floor) != 1L ||
+      !is.finite(slope_floor) ||
+      slope_floor <= 0) {
+    stop("slope_floor must be a positive finite scalar.")
+  }
+
+  M <- length(u)
+  dQ_du <- matrix(NA_real_, nrow = nrow(Q), ncol = M)
+
+  dQ_du[, 1L] <- (Q[, 2L] - Q[, 1L]) / (u[2L] - u[1L])
+  dQ_du[, M] <- (Q[, M] - Q[, M - 1L]) / (u[M] - u[M - 1L])
+
+  if (M > 2L) {
+    for (m in 2L:(M - 1L)) {
+      dQ_du[, m] <- (Q[, m + 1L] - Q[, m - 1L]) /
+        (u[m + 1L] - u[m - 1L])
+    }
+  }
+
+  dQ_du <- pmax(dQ_du, slope_floor)
+
+  density <- 1 / dQ_du
+
+  if (is.finite(density_cap)) {
+    density <- pmin(density, density_cap)
+  }
+
+  density
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# Default nuisance estimators
+# -----------------------------------------------------------------------------
+
+fit_quantile_grid <- function(X, Y, u, method = "br") {
+  X <- as.matrix(X)
+  Y <- as.numeric(Y)
+  validate_u_grid(u)
+
+  if (nrow(X) != length(Y)) {
+    stop("X and Y have incompatible dimensions.")
+  }
+
+  p <- ncol(X)
+
+  B <- vapply(
+    u,
+    FUN = function(uu) {
+      fit <- tryCatch(
+        quantreg::rq.fit(
+          x = X,
+          y = Y,
+          tau = uu,
+          method = method
+        ),
+        error = function(e) {
+          stop(
+            "Quantile regression failed at u = ", uu,
+            ". Original error: ", conditionMessage(e)
+          )
+        }
+      )
+
+      coef <- fit$coefficients
+      if (is.null(coef)) {
+        coef <- fit$coef
+      }
+
+      if (length(coef) != p || any(!is.finite(coef))) {
+        stop("Quantile regression returned invalid coefficients at u = ", uu)
+      }
+
+      as.numeric(coef)
+    },
+    FUN.VALUE = numeric(p)
+  )
+
+  list(
+    coef = t(B),
+    u = u
+  )
+}
+
+
+predict_quantile_grid <- function(fit, X_new) {
+  X_new <- as.matrix(X_new)
+
+  if (ncol(X_new) != ncol(fit$coef)) {
+    stop("X_new has the wrong number of columns.")
+  }
+
+  X_new %*% t(fit$coef)
+}
+
+
+default_nuisance_fns <- function(qr_method = "br") {
+  list(
+    fit_propensity = function(X, A) {
+      fit <- stats::glm.fit(
+        x = X,
+        y = A,
+        family = stats::binomial()
+      )
+
+      if (anyNA(fit$coefficients)) {
+        stop(
+          "The default logistic propensity model is rank deficient. ",
+          "Supply a different propensity learner or simplify X."
+        )
+      }
+
+      list(coef = fit$coefficients)
+    },
+
+    predict_propensity = function(fit, X_new) {
+      as.numeric(stats::plogis(drop(X_new %*% fit$coef)))
+    },
+
+    fit_mean = function(X, Y) {
+      fit <- stats::lm.fit(x = X, y = Y)
+
+      if (anyNA(fit$coefficients)) {
+        stop(
+          "The default linear outcome model is rank deficient. ",
+          "Supply a different outcome-regression learner or simplify X."
+        )
+      }
+
+      list(coef = fit$coefficients)
+    },
+
+    predict_mean = function(fit, X_new) {
+      as.numeric(drop(X_new %*% fit$coef))
+    },
+
+    fit_quantiles = function(X, Y, u) {
+      fit_quantile_grid(X = X, Y = Y, u = u, method = qr_method)
+    },
+
+    predict_quantiles = function(fit, X_new) {
+      predict_quantile_grid(fit, X_new)
+    }
+  )
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# Fold construction
+# -----------------------------------------------------------------------------
+
+make_stratified_folds <- function(A, K = 5L, seed = NULL) {
+  A <- as.integer(A)
+
+  if (!all(A %in% c(0L, 1L))) {
+    stop("A must be coded 0 and 1.")
+  }
+
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+
+  group_sizes <- table(A)
+
+  if (K < 2L || min(group_sizes) < K) {
+    stop(
+      "K must be at least 2 and cannot exceed the number of observations ",
+      "in either treatment arm."
+    )
+  }
+
+  fold <- integer(length(A))
+
+  for (a in c(0L, 1L)) {
+    index <- which(A == a)
+
+    fold[index] <- sample(
+      rep(seq_len(K), length.out = length(index)),
+      size = length(index),
+      replace = FALSE
+    )
+  }
+
+  fold
+}
+```
+
+
+```{r}
+# -----------------------------------------------------------------------------
+# Quantile scores eta_a(Z, u)
+# -----------------------------------------------------------------------------
+
+outcome_indicator_matrix <- function(Y, Q) {
+  sweep(
+    Q,
+    MARGIN = 1L,
+    STATS = Y,
+    FUN = function(q_row, y_i) as.numeric(y_i <= q_row)
+  )
+}
+
+
+compute_quantile_scores <- function(A,
+                                    Y,
+                                    u,
+                                    Q1,
+                                    Q0,
+                                    pi_hat,
+                                    f1_hat,
+                                    f0_hat) {
+  n <- length(Y)
+  M <- length(u)
+
+  U_mat <- matrix(
+    u,
+    nrow = n,
+    ncol = M,
+    byrow = TRUE
+  )
+
+  indicator_1 <- outcome_indicator_matrix(Y, Q1)
+  indicator_0 <- outcome_indicator_matrix(Y, Q0)
+
+  eta_1 <- sweep(
+    (U_mat - indicator_1) / f1_hat,
+    MARGIN = 1L,
+    STATS = as.numeric(A == 1L) / pi_hat,
+    FUN = "*"
+  )
+
+  eta_0 <- sweep(
+    (U_mat - indicator_0) / f0_hat,
+    MARGIN = 1L,
+    STATS = as.numeric(A == 0L) / (1 - pi_hat),
+    FUN = "*"
+  )
+
+  list(
+    eta1 = eta_1,
+    eta0 = eta_0,
+    eta_diff = eta_1 - eta_0
+  )
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# Cross-fitted nuisance estimation
+#
+# The returned object contains out-of-fold predictions for every observation.
+# Those predictions are then used by all estimators below.
+# -----------------------------------------------------------------------------
+
+crossfit_wasserstein_nuisance <- function(X,
+                                          A,
+                                          Y,
+                                          u = (seq_len(99L) - 0.5) / 99,
+                                          K = 5L,
+                                          folds = NULL,
+                                          add_intercept = TRUE,
+                                          integration = c("trapezoid", "midpoint"),
+                                          propensity_bound = 0.01,
+                                          slope_floor = NULL,
+                                          density_cap = Inf,
+                                          rearrange = TRUE,
+                                          nuisance_fns = default_nuisance_fns(),
+                                          seed = NULL) {
+  integration <- match.arg(integration)
+
+  required_fns <- c(
+    "fit_propensity",
+    "predict_propensity",
+    "fit_mean",
+    "predict_mean",
+    "fit_quantiles",
+    "predict_quantiles"
+  )
+
+  if (!all(required_fns %in% names(nuisance_fns))) {
+    stop(
+      "nuisance_fns must contain: ",
+      paste(required_fns, collapse = ", ")
+    )
+  }
+
+  X <- make_design_matrix(X, add_intercept = add_intercept)
+  A <- as.integer(A)
+  Y <- as.numeric(Y)
+
+  if (!all(A %in% c(0L, 1L))) {
+    stop("A must be coded exactly 0 and 1.")
+  }
+
+  if (nrow(X) != length(A) || length(A) != length(Y)) {
+    stop("X, A, and Y have incompatible dimensions.")
+  }
+
+  if (any(!is.finite(Y))) {
+    stop("Y contains non-finite values.")
+  }
+
+  validate_u_grid(u)
+  w <- quadrature_weights(u, rule = integration)
+
+  n <- nrow(X)
+  M <- length(u)
+
+  if (is.null(folds)) {
+    folds <- make_stratified_folds(A = A, K = K, seed = seed)
+  } else {
+    if (length(folds) != n) {
+      stop("folds must have length n.")
+    }
+
+    folds <- match(folds, unique(folds))
+
+    if (length(unique(folds)) < 2L) {
+      stop("folds must contain at least two folds.")
+    }
+  }
+
+  if (is.null(slope_floor)) {
+    y_scale <- stats::mad(Y, constant = 1)
+
+    if (!is.finite(y_scale) || y_scale <= 0) {
+      y_scale <- stats::sd(Y)
+    }
+
+    if (!is.finite(y_scale) || y_scale <= 0) {
+      y_scale <- 1
+    }
+
+    slope_floor <- 1e-6 * y_scale
+  }
+
+  Q1 <- matrix(NA_real_, nrow = n, ncol = M)
+  Q0 <- matrix(NA_real_, nrow = n, ncol = M)
+
+  mu1 <- rep(NA_real_, n)
+  mu0 <- rep(NA_real_, n)
+  pi_hat <- rep(NA_real_, n)
+
+  for (fold_id in sort(unique(folds))) {
+    test_id <- which(folds == fold_id)
+    train_id <- which(folds != fold_id)
+
+    if (length(unique(A[train_id])) != 2L) {
+      stop(
+        "At least one training fold lacks a treatment arm. ",
+        "Reduce K or provide valid folds."
+      )
+    }
+
+    X_train <- X[train_id, , drop = FALSE]
+    X_test <- X[test_id, , drop = FALSE]
+
+    A_train <- A[train_id]
+    Y_train <- Y[train_id]
+
+    # Propensity model.
+    pi_fit <- nuisance_fns$fit_propensity(X_train, A_train)
+    pi_hat[test_id] <- nuisance_fns$predict_propensity(pi_fit, X_test)
+
+    # Conditional mean models.
+    mu1_fit <- nuisance_fns$fit_mean(
+      X_train[A_train == 1L, , drop = FALSE],
+      Y_train[A_train == 1L]
+    )
+
+    mu0_fit <- nuisance_fns$fit_mean(
+      X_train[A_train == 0L, , drop = FALSE],
+      Y_train[A_train == 0L]
+    )
+
+    mu1[test_id] <- nuisance_fns$predict_mean(mu1_fit, X_test)
+    mu0[test_id] <- nuisance_fns$predict_mean(mu0_fit, X_test)
+
+    # Conditional quantile models.
+    q1_fit <- nuisance_fns$fit_quantiles(
+      X_train[A_train == 1L, , drop = FALSE],
+      Y_train[A_train == 1L],
+      u
+    )
+
+    q0_fit <- nuisance_fns$fit_quantiles(
+      X_train[A_train == 0L, , drop = FALSE],
+      Y_train[A_train == 0L],
+      u
+    )
+
+    q1_test <- as.matrix(nuisance_fns$predict_quantiles(q1_fit, X_test))
+    q0_test <- as.matrix(nuisance_fns$predict_quantiles(q0_fit, X_test))
+
+    if (nrow(q1_test) != length(test_id) || ncol(q1_test) != M ||
+        nrow(q0_test) != length(test_id) || ncol(q0_test) != M) {
+      stop(
+        "The quantile prediction function must return an ",
+        "n_test by length(u) matrix."
+      )
+    }
+
+    if (rearrange) {
+      q1_test <- rearrange_quantile_matrix(q1_test, u = u, w = w)
+      q0_test <- rearrange_quantile_matrix(q0_test, u = u, w = w)
+    }
+
+    Q1[test_id, ] <- q1_test
+    Q0[test_id, ] <- q0_test
+  }
+
+  if (any(!is.finite(pi_hat)) ||
+      any(!is.finite(mu1)) ||
+      any(!is.finite(mu0)) ||
+      any(!is.finite(Q1)) ||
+      any(!is.finite(Q0))) {
+    stop("Cross-fitting produced non-finite nuisance predictions.")
+  }
+
+  if (!is.numeric(propensity_bound) ||
+      length(propensity_bound) != 1L ||
+      propensity_bound <= 0 ||
+      propensity_bound >= 0.5) {
+    stop("propensity_bound must lie strictly between 0 and 0.5.")
+  }
+
+  pi_hat <- pmin(
+    pmax(pi_hat, propensity_bound),
+    1 - propensity_bound
+  )
+
+  f1_hat <- density_from_quantile_grid(
+    Q = Q1,
+    u = u,
+    slope_floor = slope_floor,
+    density_cap = density_cap
+  )
+
+  f0_hat <- density_from_quantile_grid(
+    Q = Q0,
+    u = u,
+    slope_floor = slope_floor,
+    density_cap = density_cap
+  )
+
+  scores <- compute_quantile_scores(
+    A = A,
+    Y = Y,
+    u = u,
+    Q1 = Q1,
+    Q0 = Q0,
+    pi_hat = pi_hat,
+    f1_hat = f1_hat,
+    f0_hat = f0_hat
+  )
+
+  delta <- Q1 - Q0
+
+  tau_x_quantile <- integrate_u(delta, w)
+  tau_x_mean <- mu1 - mu0
+
+  R_tau <- (
+    A / pi_hat * (Y - mu1) -
+      (1 - A) / (1 - pi_hat) * (Y - mu0)
+  )
+
+  bar_delta <- colMeans(delta)
+  tau_quantile <- integrate_u(bar_delta, w)
+
+  structure(
+    list(
+      X = X,
+      A = A,
+      Y = Y,
+      u = u,
+      w = w,
+      folds = folds,
+
+      pi_hat = pi_hat,
+      mu1 = mu1,
+      mu0 = mu0,
+
+      Q1 = Q1,
+      Q0 = Q0,
+      f1_hat = f1_hat,
+      f0_hat = f0_hat,
+
+      delta = delta,
+      eta1 = scores$eta1,
+      eta0 = scores$eta0,
+      eta_diff = scores$eta_diff,
+
+      tau_x_quantile = tau_x_quantile,
+      tau_x_mean = tau_x_mean,
+      R_tau = R_tau,
+
+      bar_delta = bar_delta,
+      tau_quantile = tau_quantile,
+
+      slope_floor = slope_floor,
+      propensity_bound = propensity_bound
+    ),
+    class = "wasserstein_nuisance"
+  )
+}
+```
+
+
+```{r}
+# -----------------------------------------------------------------------------
+# Term 1: Conditional Wasserstein effect psi^2(X_i)
+#
+# For the observed X_i, this returns the cross-fitted estimate
+#
+#   psi_hat^2(X_i) = sum_m w_m Delta_hat(X_i, u_m)^2.
+# -----------------------------------------------------------------------------
+
+# Conditional Wasserstein effect
+estimate_psi2_x <- function(cf) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  integrate_u(cf$delta^2, cf$w)
+}
+
+
+# Average Wasserstein effect
+
+# -----------------------------------------------------------------------------
+# Overall Wasserstein effect Psi^2
+#
+# Psi_hat^2 =
+#   n^{-1} sum_i int [
+#     Delta_hat(X_i,u)^2 +
+#     2 Delta_hat(X_i,u) {eta_hat_1(Z_i,u) - eta_hat_0(Z_i,u)}
+#   ] du.
+# -----------------------------------------------------------------------------
+
+estimate_Psi2 <- function(cf) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  plug_in_i <- integrate_u(cf$delta^2, cf$w)
+
+  correction_i <- 2 * integrate_u(
+    cf$delta * cf$eta_diff,
+    cf$w
+  )
+
+  contribution_i <- plug_in_i + correction_i
+  estimate <- mean(contribution_i)
+
+  list(
+    estimate = estimate,
+    plug_in = mean(plug_in_i),
+    correction = mean(correction_i),
+    contribution = contribution_i,
+    influence = contribution_i - estimate,
+    se = standard_error_from_if(contribution_i - estimate)
+  )
+}
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Average treatment effect tau by AIPW
+#
+# tau_hat =
+#   n^{-1} sum_i [
+#     mu_hat_1(X_i) - mu_hat_0(X_i) + R_hat_tau(Z_i)
+#   ].
+# -----------------------------------------------------------------------------
+
+estimate_tau_aipw <- function(cf) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  contribution_i <- (cf$mu1 - cf$mu0) + cf$R_tau
+  estimate <- mean(contribution_i)
+
+  list(
+    estimate = estimate,
+    contribution = contribution_i,
+    influence = contribution_i - estimate,
+    se = standard_error_from_if(contribution_i - estimate)
+  )
+}
+
+
+get_tau_x <- function(cf,
+                      tau_x_method = c("quantile", "outcome_mean")) {
+  tau_x_method <- match.arg(tau_x_method)
+
+  if (tau_x_method == "quantile") {
+    return(cf$tau_x_quantile)
+  }
+  
+  cf$tau_x_mean
+}
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# V[tau(X)]
+#
+# V_hat[tau(X)] =
+#   n^{-1} sum_i [
+#     {tau_hat(X_i) - tau_hat}^2 +
+#     2 {tau_hat(X_i) - tau_hat} R_hat_tau(Z_i)
+#   ].
+# -----------------------------------------------------------------------------
+estimate_V_tauX <- function(cf,
+                            tau_hat = NULL,
+                            tau_x_method = c("quantile", "outcome_mean")) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  tau_x_method <- match.arg(tau_x_method)
+
+  if (is.null(tau_hat)) {
+    tau_hat <- estimate_tau_aipw(cf)$estimate
+  }
+
+  tau_x_hat <- get_tau_x(cf, tau_x_method = tau_x_method)
+  centered_tau_x <- tau_x_hat - tau_hat
+
+  contribution_i <- (
+    centered_tau_x^2 +
+      2 * centered_tau_x * cf$R_tau
+  )
+
+  estimate <- mean(contribution_i)
+
+  list(
+    estimate = estimate,
+    tau_hat = tau_hat,
+    tau_x_hat = tau_x_hat,
+    contribution = contribution_i,
+    influence = contribution_i - estimate,
+    se = standard_error_from_if(contribution_i - estimate)
+  )
+}
+
+# -----------------------------------------------------------------------------
+# V[bar Delta(U)]
+#
+# Define
+#
+#   b_hat(u) = bar Delta_hat(u) - tau_center.
+#
+# `centering = "aipw"` matches your displayed estimator, using the AIPW
+# estimator tau_hat as tau_center.
+#
+# `centering = "quantile"` uses
+#
+#   tau_center = int bar Delta_hat(u) du,
+#
+# and therefore preserves exact centering of b_hat over the grid.
+# This is useful for verifying the finite-sample ANOVA identity.
+# -----------------------------------------------------------------------------
+estimate_V_bU <- function(cf,
+                          tau_hat = NULL,
+                          centering = c("aipw", "quantile")) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  centering <- match.arg(centering)
+
+  if (is.null(tau_hat)) {
+    tau_hat <- estimate_tau_aipw(cf)$estimate
+  }
+
+  tau_center <- if (centering == "aipw") {
+    tau_hat
+  } else {
+    cf$tau_quantile
+  }
+
+  b_hat <- cf$bar_delta - tau_center
+
+  plug_in <- integrate_u(b_hat^2, cf$w)
+
+  score_correction_i <- 2 * integrate_u(
+    sweep(cf$eta_diff, 2L, b_hat, FUN = "*"),
+    cf$w
+  )
+
+  estimate <- plug_in + mean(score_correction_i)
+
+  # A clean empirical influence-function standard error is supplied for
+  # quantile centering, where int b_hat(u) du = 0 by construction.
+  if (centering == "quantile") {
+    x_component_i <- 2 * (
+      integrate_u(
+        sweep(cf$delta, 2L, b_hat, FUN = "*"),
+        cf$w
+      ) - plug_in
+    )
+
+    influence <- x_component_i + score_correction_i
+    se <- standard_error_from_if(influence)
+  } else {
+    influence <- rep(NA_real_, length(cf$Y))
+    se <- NA_real_
+  }
+
+  list(
+    estimate = estimate,
+    plug_in = plug_in,
+    correction = mean(score_correction_i),
+    b_hat = b_hat,
+    tau_center = tau_center,
+    score_correction = score_correction_i,
+    influence = influence,
+    se = se
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Interaction component
+#
+# c_hat(x,u) =
+#   Delta_hat(x,u) -
+#   tau_hat(x) -
+#   bar Delta_hat(u) +
+#   tau_center.
+# -----------------------------------------------------------------------------
+make_c_hat <- function(cf,
+                       tau_x_method = c("quantile", "outcome_mean"),
+                       tau_center) {
+  tau_x_method <- match.arg(tau_x_method)
+
+  tau_x_hat <- get_tau_x(cf, tau_x_method = tau_x_method)
+
+  c_hat <- sweep(cf$delta, 1L, tau_x_hat, FUN = "-")
+  c_hat <- sweep(c_hat, 2L, cf$bar_delta, FUN = "-")
+  c_hat <- c_hat + tau_center
+
+  c_hat
+}
+
+# -----------------------------------------------------------------------------
+# V[c(X,U)]
+#
+# V_hat[c(X,U)] =
+#   n^{-1} sum_i int [
+#     c_hat(X_i,u)^2 +
+#     2 c_hat(X_i,u) {eta_hat_1(Z_i,u) - eta_hat_0(Z_i,u)}
+#   ] du.
+# -----------------------------------------------------------------------------
+
+estimate_V_cXU <- function(cf,
+                           tau_hat = NULL,
+                           tau_x_method = c("quantile", "outcome_mean"),
+                           centering = c("aipw", "quantile")) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  tau_x_method <- match.arg(tau_x_method)
+  centering <- match.arg(centering)
+
+  if (is.null(tau_hat)) {
+    tau_hat <- estimate_tau_aipw(cf)$estimate
+  }
+
+  tau_center <- if (centering == "aipw") {
+    tau_hat
+  } else {
+    cf$tau_quantile
+  }
+
+  c_hat <- make_c_hat(
+    cf = cf,
+    tau_x_method = tau_x_method,
+    tau_center = tau_center
+  )
+
+  plug_in_i <- integrate_u(c_hat^2, cf$w)
+
+  correction_i <- 2 * integrate_u(
+    c_hat * cf$eta_diff,
+    cf$w
+  )
+
+  contribution_i <- plug_in_i + correction_i
+  estimate <- mean(contribution_i)
+  
+  list(
+    estimate = estimate,
+    plug_in = mean(plug_in_i),
+    correction = mean(correction_i),
+    c_hat = c_hat,
+    tau_center = tau_center,
+    contribution = contribution_i,
+    influence = contribution_i - estimate,
+    se = standard_error_from_if(contribution_i - estimate)
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# Pure plug-in decomposition
+#
+# This is included as a diagnostic. It uses a common quantile-based centering:
+#
+#   tau_q = mean_i int Delta_hat(X_i,u) du
+#
+# and should satisfy the discrete ANOVA identity up to floating-point error.
+# -----------------------------------------------------------------------------
+plugin_decomposition <- function(cf) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  tau_x <- cf$tau_x_quantile
+  tau_q <- cf$tau_quantile
+
+  b_hat <- cf$bar_delta - tau_q
+
+  c_hat <- make_c_hat(
+    cf = cf,
+    tau_x_method = "quantile",
+    tau_center = tau_q
+  )
+
+  psi2 <- mean(integrate_u(cf$delta^2, cf$w))
+  tau2 <- tau_q^2
+  V_tauX <- mean((tau_x - tau_q)^2)
+  V_bU <- integrate_u(b_hat^2, cf$w)
+  V_cXU <- mean(integrate_u(c_hat^2, cf$w))
+
+  decomposition_sum <- tau2 + V_tauX + V_bU + V_cXU
+
+  list(
+    Psi2 = psi2,
+    tau = tau_q,
+    tau2 = tau2,
+    V_tauX = V_tauX,
+    V_bU = V_bU,
+    V_cXU = V_cXU,
+    decomposition_sum = decomposition_sum,
+    decomposition_gap = psi2 - decomposition_sum
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Full one-step decomposition
+# -----------------------------------------------------------------------------
+
+estimate_wasserstein_decomposition <- function(
+    cf,
+    tau_x_method = c("quantile", "outcome_mean"),
+    centering = c("aipw", "quantile")) {
+  stopifnot(inherits(cf, "wasserstein_nuisance"))
+
+  tau_x_method <- match.arg(tau_x_method)
+  centering <- match.arg(centering)
+
+  psi2_fit <- estimate_Psi2(cf)
+  tau_fit <- estimate_tau_aipw(cf)
+
+  tau2_fit <- list(
+    estimate = tau_fit$estimate^2,
+    influence = 2 * tau_fit$estimate * tau_fit$influence,
+    se = standard_error_from_if(
+      2 * tau_fit$estimate * tau_fit$influence
+    )
+  )
+
+  V_tauX_fit <- estimate_V_tauX(
+    cf = cf,
+    tau_hat = tau_fit$estimate,
+    tau_x_method = tau_x_method
+  )
+
+  V_bU_fit <- estimate_V_bU(
+    cf = cf,
+    tau_hat = tau_fit$estimate,
+    centering = centering
+  )
+
+  V_cXU_fit <- estimate_V_cXU(
+    cf = cf,
+    tau_hat = tau_fit$estimate,
+    tau_x_method = tau_x_method,
+    centering = centering
+  )
+
+  decomposition_sum <- (
+    tau2_fit$estimate +
+      V_tauX_fit$estimate +
+      V_bU_fit$estimate +
+      V_cXU_fit$estimate
+  )
+
+  list(
+    Psi2 = psi2_fit,
+    tau = tau_fit,
+    tau2 = tau2_fit,
+    V_tauX = V_tauX_fit,
+    V_bU = V_bU_fit,
+    V_cXU = V_cXU_fit,
+
+    one_step_decomposition_sum = decomposition_sum,
+    one_step_decomposition_gap = (
+      psi2_fit$estimate - decomposition_sum
+    ),
+
+    plugin_check = plugin_decomposition(cf)
+  )
+}
+```
+
+```{r}
+# FOR EXAMPLE IMPLEMENTATION, MAKES estimate_terms FUNCTION 
+library(quantreg)
+
+set.seed(42)
+
+n <- 3000
+u_grid <- seq(0.02, 0.98, length.out = 49)
+
+estimate_terms <- function(dat) {
+  X_mat <- model.matrix(~ factor(X), data = dat)
+
+  cf <- crossfit_wasserstein_nuisance(
+    X = X_mat,
+    A = dat$A,
+    Y = dat$Y,
+    u = u_grid,
+    K = 5,
+    add_intercept = FALSE,
+    rearrange = TRUE,
+    seed = 2026
+  )
+
+  fit <- estimate_wasserstein_decomposition(
+    cf,
+    tau_x_method = "quantile",
+    centering = "aipw"
+  )
+
+  data.frame(
+    term = c(
+      "Psi2",
+      "tau",
+      "tau2",
+      "V_tauX",
+      "V_bU",
+      "V_cXU",
+      "sum_of_terms",
+      "gap"
+    ),
+    estimate = c(
+      fit$Psi2$estimate,
+      fit$tau$estimate,
+      fit$tau2$estimate,
+      fit$V_tauX$estimate,
+      fit$V_bU$estimate,
+      fit$V_cXU$estimate,
+      fit$one_step_decomposition_sum,
+      fit$one_step_decomposition_gap
+    )
+  )
+}
+
+```
+
+```{r}
+# EXAMPLE 1 SIMULTATIONS
+
+X <- sample(1:3, size = n, replace = TRUE)
+A <- rbinom(n, size = 1, prob = 0.5)
+
+mu0 <- c(20, 30, 40)
+sd0 <- c(1, 1, 1)
+
+mu1 <- c(30, 40, 50)
+sd1 <- c(1, 1, 1)
+
+Y <- rnorm(
+  n,
+  mean = ifelse(A == 1, mu1[X], mu0[X]),
+  sd   = ifelse(A == 1, sd1[X], sd0[X])
+)
+
+dat1 <- data.frame(X = X, A = A, Y = Y)
+
+case1_results <- estimate_terms(dat1)
+case1_results
+
+```
+
+```{r}
+# EXAMPLE 2 SIMULATION
+
+X <- sample(1:3, size = n, replace = TRUE)
+A <- rbinom(n, size = 1, prob = 0.5)
+
+mu0 <- c(20, 30, 40)
+sd0 <- c(1, 1, 1)
+
+mu1 <- c(10, 30, 50)
+sd1 <- c(3, 3, 3)
+
+Y <- rnorm(
+  n,
+  mean = ifelse(A == 1, mu1[X], mu0[X]),
+  sd   = ifelse(A == 1, sd1[X], sd0[X])
+)
+
+dat2 <- data.frame(X = X, A = A, Y = Y)
+
+case2_results <- estimate_terms(dat2)
+case2_results
+```
+
+```{r}
+# EXAMPLE 3 SIMULATION
+X <- sample(1:3, size = n, replace = TRUE)
+A <- rbinom(n, size = 1, prob = 0.5)
+
+mu0 <- c(20, 30, 40)
+sd0 <- c(1, 1, 1)
+
+mu1 <- c(10, 30, 50)
+sd1 <- c(1, 2, 3)
+
+Y <- rnorm(
+  n,
+  mean = ifelse(A == 1, mu1[X], mu0[X]),
+  sd   = ifelse(A == 1, sd1[X], sd0[X])
+)
+
+dat3 <- data.frame(X = X, A = A, Y = Y)
+
+case3_results <- estimate_terms(dat3)
+case3_results
+
+```
+
+
+
+
+```{r}
+# EXAMPLE 1 VISUAL
+
+library(plotly)
+
+set.seed(123)
+
+
+
+n_per_group <- 200
+
+species <- rep(1:3, each = 2 * n_per_group)
+
+soil_type <- rep(
+  rep(c(1, 0), each = n_per_group),
+  times = 3
+)
+
+p_11 <- rnorm(n_per_group, mean = 30, sd = 1)
+p_10 <- rnorm(n_per_group, mean = 20, sd = 1)
+
+p_21 <- rnorm(n_per_group, mean = 40, sd = 1)
+p_20 <- rnorm(n_per_group, mean = 30, sd = 1)
+
+p_31 <- rnorm(n_per_group, mean = 50, sd = 1)
+p_30 <- rnorm(n_per_group, mean = 40, sd = 1)
+
+p <- c(
+  p_11, p_10,
+  p_21, p_20,
+  p_31, p_30
+)
+
+dat <- data.frame(
+  species = factor(species),
+  soil_type = factor(soil_type),
+  p = p
+)
+
+# ------------------------------------------------------------
+# Horizontal positions:
+# large gaps between species, small gaps within species
+# ------------------------------------------------------------
+
+species_x <- c("1" = 1, "2" = 4, "3" = 7)
+
+soil_offset <- c(
+  "0" = -0.28,
+  "1" =  0.28
+)
+
+soil_colors <- c(
+  "0" = "royalblue",
+  "1" = "red"
+)
+
+# Use one common support grid so curves are directly comparable
+p_grid <- seq(
+  min(dat$p) - 2,
+  max(dat$p) + 2,
+  length.out = 250
+)
+
+fig <- plot_ly()
+
+for (sp in levels(dat$species)) {
+  for (soil in levels(dat$soil_type)) {
+
+    values <- dat$p[
+      dat$species == sp &
+      dat$soil_type == soil
+    ]
+
+    dens <- density(
+      values,
+      from = min(p_grid),
+      to = max(p_grid),
+      n = length(p_grid)
+    )
+
+    x_location <- species_x[sp] + soil_offset[soil]
+
+    # 3D density curve
+    fig <- fig %>%
+      add_trace(
+        type = "scatter3d",
+        mode = "lines",
+        x = rep(x_location, length(dens$x)),
+        y = dens$x,
+        z = dens$y,
+        line = list(
+          color = soil_colors[soil],
+          width = 8
+        ),
+        name = paste("Soil", soil),
+        legendgroup = paste("Soil", soil),
+        showlegend = (sp == "1"),
+        hovertemplate = paste0(
+          "Species: ", sp,
+          "<br>Soil type: ", soil,
+          "<br>Outcome: %{y:.2f}",
+          "<br>Density: %{z:.3f}",
+          "<extra></extra>"
+        )
+      ) %>%
+      # Optional baseline for locating each curve in 3D space
+      add_trace(
+        type = "scatter3d",
+        mode = "lines",
+        x = rep(x_location, length(dens$x)),
+        y = dens$x,
+        z = rep(0, length(dens$x)),
+        line = list(
+          color = soil_colors[soil],
+          width = 2,
+          dash = "dot"
+        ),
+        legendgroup = paste("Soil", soil),
+        showlegend = FALSE,
+        hoverinfo = "skip"
+      )
+  }
+}
+
+fig %>%
+  layout(
+    title = "Distributional Curves by Species and Soil Type",
+    legend = list(
+      title = list(text = "Soil type")
+    ),
+    scene = list(
+      xaxis = list(
+        title = "X",
+        tickvals = unname(species_x),
+        ticktext = names(species_x),
+        range = c(0, 8),
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      yaxis = list(
+        title = "Y",
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      zaxis = list(
+        title = "Density",
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      camera = list(
+        eye = list(x = 1.5, y = -1.7, z = 1.1)
+      )
+    )
+  )
+
+```
+
+
+```{r}
+# EXAMPLE 2 VISUAL
+library(plotly)
+
+set.seed(123)
+
+
+
+n_per_group <- 200
+
+species <- rep(1:3, each = 2 * n_per_group)
+
+soil_type <- rep(
+  rep(c(1, 0), each = n_per_group),
+  times = 3
+)
+
+# Treated distributions: variance = 4, so sd = 2
+p_11 <- rnorm(n_per_group, mean = 10, sd = 3)
+p_21 <- rnorm(n_per_group, mean = 30, sd = 3)
+p_31 <- rnorm(n_per_group, mean = 50, sd = 3)
+
+# Untreated distributions unchanged: sd = 1
+p_10 <- rnorm(n_per_group, mean = 20, sd = 1)
+p_20 <- rnorm(n_per_group, mean = 30, sd = 1)
+p_30 <- rnorm(n_per_group, mean = 40, sd = 1)
+
+p <- c(
+  p_11, p_10,
+  p_21, p_20,
+  p_31, p_30
+)
+
+dat <- data.frame(
+  species = factor(species),
+  soil_type = factor(soil_type),
+  p = p
+)
+
+# ------------------------------------------------------------
+# x-axis spacing:
+# bigger gaps between species, smaller gaps within species
+# ------------------------------------------------------------
+
+species_x <- c("1" = 1, "2" = 4, "3" = 7)
+soil_offset <- c("0" = -0.28, "1" = 0.28)
+
+soil_colors <- c(
+  "0" = "royalblue",
+  "1" = "red"
+)
+
+# Common support for all density curves
+p_grid <- seq(
+  min(dat$p) - 2,
+  max(dat$p) + 2,
+  length.out = 1000
+)
+
+fig <- plot_ly()
+
+for (sp in levels(dat$species)) {
+  for (soil in levels(dat$soil_type)) {
+    
+    values <- dat$p[
+      dat$species == sp &
+      dat$soil_type == soil
+    ]
+    
+    # Smooth kernel density estimate
+    dens <- density(
+      values,
+      from = min(p_grid),
+      to = max(p_grid),
+      n = 1000,
+      adjust = 1.4
+    )
+    
+    x_location <- species_x[sp] + soil_offset[soil]
+    
+    # Main 3D density curve
+    fig <- fig %>%
+      add_trace(
+        type = "scatter3d",
+        mode = "lines",
+        x = rep(x_location, length(dens$x)),
+        y = dens$x,
+        z = dens$y,
+        line = list(
+          color = soil_colors[soil],
+          width = 8
+        ),
+        name = paste("Soil", soil),
+        legendgroup = paste("Soil", soil),
+        showlegend = (sp == "1"),
+        hovertemplate = paste0(
+          "Species: ", sp,
+          "<br>Soil type: ", soil,
+          "<br>Outcome: %{y:.2f}",
+          "<br>Density: %{z:.3f}",
+          "<extra></extra>"
+        )
+      ) %>%
+      # Baseline beneath each curve
+      add_trace(
+        type = "scatter3d",
+        mode = "lines",
+        x = rep(x_location, length(dens$x)),
+        y = dens$x,
+        z = rep(0, length(dens$x)),
+        line = list(
+          color = soil_colors[soil],
+          width = 2,
+          dash = "dot"
+        ),
+        legendgroup = paste("Soil", soil),
+        showlegend = FALSE,
+        hoverinfo = "skip"
+      )
+  }
+}
+
+fig %>%
+  layout(
+    title = "Smoothed Distributional Curves by Species and Soil Type",
+    legend = list(
+      title = list(text = "Soil type")
+    ),
+    scene = list(
+      xaxis = list(
+        title = "X",
+        tickvals = unname(species_x),
+        ticktext = names(species_x),
+        range = c(0, 8),
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      yaxis = list(
+        title = "Y",
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      zaxis = list(
+        title = "Density",
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      camera = list(
+        eye = list(x = 1.5, y = -1.7, z = 1.1)
+      )
+    )
+  )
+```
+
+```{r}
+# EXAMPLE 3 VISUAL
+library(plotly)
+
+set.seed(123)
+
+# ------------------------------------------------------------
+# Simulate:
+# 3 species × 2 soil types × 200 observations = 1200 total
+#
+# Soil type 1 = treated (red)
+# Soil type 0 = untreated (blue)
+#
+# Treated variance = 4  => treated SD = 2
+# Treated means: 10, 30, 50
+#
+# Untreated distributions remain the same:
+# means: 10, 20, 30
+# SD = 1
+# ------------------------------------------------------------
+
+n_per_group <- 200
+
+species <- rep(1:3, each = 2 * n_per_group)
+
+soil_type <- rep(
+  rep(c(1, 0), each = n_per_group),
+  times = 3
+)
+
+# Treated distributions: variance = 4, so sd = 2
+p_11 <- rnorm(n_per_group, mean = 10, sd = 1)
+p_21 <- rnorm(n_per_group, mean = 30, sd = 2)
+p_31 <- rnorm(n_per_group, mean = 50, sd = 3)
+
+# Untreated distributions unchanged: sd = 1
+p_10 <- rnorm(n_per_group, mean = 20, sd = 1)
+p_20 <- rnorm(n_per_group, mean = 30, sd = 1)
+p_30 <- rnorm(n_per_group, mean = 40, sd = 1)
+
+p <- c(
+  p_11, p_10,
+  p_21, p_20,
+  p_31, p_30
+)
+
+dat <- data.frame(
+  species = factor(species),
+  soil_type = factor(soil_type),
+  p = p
+)
+
+# ------------------------------------------------------------
+# x-axis spacing:
+# bigger gaps between species, smaller gaps within species
+# ------------------------------------------------------------
+
+species_x <- c("1" = 1, "2" = 4, "3" = 7)
+soil_offset <- c("0" = -0.28, "1" = 0.28)
+
+soil_colors <- c(
+  "0" = "royalblue",
+  "1" = "red"
+)
+
+# Common support for all density curves
+p_grid <- seq(
+  min(dat$p) - 2,
+  max(dat$p) + 2,
+  length.out = 1000
+)
+
+fig <- plot_ly()
+
+for (sp in levels(dat$species)) {
+  for (soil in levels(dat$soil_type)) {
+    
+    values <- dat$p[
+      dat$species == sp &
+      dat$soil_type == soil
+    ]
+    
+    # Smooth kernel density estimate
+    dens <- density(
+      values,
+      from = min(p_grid),
+      to = max(p_grid),
+      n = 1000,
+      adjust = 1.4
+    )
+    
+    x_location <- species_x[sp] + soil_offset[soil]
+    
+    # Main 3D density curve
+    fig <- fig %>%
+      add_trace(
+        type = "scatter3d",
+        mode = "lines",
+        x = rep(x_location, length(dens$x)),
+        y = dens$x,
+        z = dens$y,
+        line = list(
+          color = soil_colors[soil],
+          width = 8
+        ),
+        name = paste("Soil", soil),
+        legendgroup = paste("Soil", soil),
+        showlegend = (sp == "1"),
+        hovertemplate = paste0(
+          "Species: ", sp,
+          "<br>Soil type: ", soil,
+          "<br>Outcome: %{y:.2f}",
+          "<br>Density: %{z:.3f}",
+          "<extra></extra>"
+        )
+      ) %>%
+      # Baseline beneath each curve
+      add_trace(
+        type = "scatter3d",
+        mode = "lines",
+        x = rep(x_location, length(dens$x)),
+        y = dens$x,
+        z = rep(0, length(dens$x)),
+        line = list(
+          color = soil_colors[soil],
+          width = 2,
+          dash = "dot"
+        ),
+        legendgroup = paste("Soil", soil),
+        showlegend = FALSE,
+        hoverinfo = "skip"
+      )
+  }
+}
+
+fig %>%
+  layout(
+    title = "Smoothed Distributional Curves by Species and Soil Type",
+    legend = list(
+      title = list(text = "Soil type")
+    ),
+    scene = list(
+      xaxis = list(
+        title = "X",
+        tickvals = unname(species_x),
+        ticktext = names(species_x),
+        range = c(0, 8),
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      yaxis = list(
+        title = "Y",
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      zaxis = list(
+        title = "Density",
+        showgrid = FALSE,
+        zeroline = FALSE,
+        showbackground = FALSE
+      ),
+      camera = list(
+        eye = list(x = 1.5, y = -1.7, z = 1.1)
+      )
+    )
+  )
+```
+
+
+```{r}
+# JOB CORPS EXAMPLE FOR DR. SCHINDL, DR. WASSERMAN
+#install.packages('causalweight')
+pkg <- "causalweight"
+repo <- "https://cloud.r-project.org"
+ap <- available.packages(repos = repo)
+ver <- ap[pkg, "Version"]
+tarball <- tempfile(fileext = ".tar.gz")
+url <- sprintf("%s/src/contrib/%s_%s.tar.gz", repo, pkg, ver)
+download.file(url, tarball, mode = "wb")
+# Extract only the JC data file
+exdir <- tempfile()
+untar(
+  tarball,
+  files = sprintf("%s/data/JC.RData", pkg),
+  exdir = exdir
+)
+# Load JC into your R environment
+load(file.path(exdir, pkg, "data", "JC.RData"))
+dim(JC)
+names(JC)
+
+
+
+dat <- JC
+
+A <- dat$assignment
+Y <- dat$earny4
+X <- dat[, c("female", "age", "educ", "everwkd", "mwearn")]
+
+dat_jc <- data.frame(X = X[,"everwkd", ], A, Y)
+estimate_terms(dat_jc)
+```
+
+
